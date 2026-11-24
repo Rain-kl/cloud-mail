@@ -69,7 +69,7 @@ jobs:
           fi
       - uses: pnpm/action-setup@v4
         with:
-          version: 9.15.9
+          version: 12.9.1
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -141,7 +141,7 @@ jobs:
             .github/otsmail/wrangler.json > "$config"
           active=$(wrangler deployments status --config "$config" --json | jq -er '.versions[] | select(.percentage==100) | .version_id')
           current_tag=$(wrangler versions view "$active" --config "$config" --json | jq -r '.annotations["workers/tag"] // ""')
-          if [[ "$current_tag" == "$tag" ]]; then
+          if [[ "$current_tag" == "$tag" && "$GITHUB_EVENT_NAME" == schedule ]]; then
             echo "OtsMail $WEB_VERSION ($source) is already deployed."
             exit 0
           fi
@@ -152,7 +152,7 @@ jobs:
           deployed=$(wrangler deployments status --config "$config" --json | jq -er '.versions[] | select(.percentage==100) | .version_id')
           [[ "$deployed" == "$candidate" ]]
           if ! curl --fail --silent --show-error --retry 3 --retry-all-errors --max-time 12 \
-            "$SITE_URL/api/setting/websiteConfig" | jq -e '.code == 200 and (.data.domainList | length > 0)' >/dev/null; then
+            "$SITE_URL/api/setting/websiteConfig" | jq -e '.code == 200 and (.data | has("loginTheme")) and (.data.domainList | length > 0)' >/dev/null; then
             wrangler versions deploy "$active@100%" --config "$config" --yes --message "Rollback after OtsMail health check failed"
             echo "::error::Website configuration check failed. Previous Worker version restored."
             exit 1
