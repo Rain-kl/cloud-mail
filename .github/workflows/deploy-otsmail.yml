@@ -1,0 +1,159 @@
+name: Deploy OtsMail to Cloudflare Workers
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy to the production OtsMail Worker
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: otsmail-deploy
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || vars.OTSMAIL_AUTO_UPDATE == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select stable OtsMail source
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=$(jq -er .version .github/otsmail/baseline.json)
+          source=$(jq -er .commit .github/otsmail/baseline.json)
+          latest=$(gh api --paginate repos/otscup/otsmail/releases \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | sed -nE 's/^web-v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' | sort -Vr | sed -n '1p')
+          version=$baseline
+          if [[ -n "$latest" && "$latest" != "$baseline" ]] && [[ $(printf '%s\n' "$baseline" "$latest" | sort -Vr | sed -n '1p') == "$latest" ]]; then
+            version=$latest
+            source=refs/tags/web-v$latest
+          fi
+          [[ "$baseline" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$source" =~ ^[a-f0-9]{40}$ || "$source" == "refs/tags/web-v$version" ]]
+          printf 'version=%s\nsource=%s\n' "$version" "$source" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: otscup/otsmail
+          ref: ${{ steps.release.outputs.source }}
+          path: upstream
+          persist-credentials: false
+      - name: Check database and Durable Object compatibility
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=$(jq -er .commit ../.github/otsmail/baseline.json)
+          if [[ $(git rev-parse HEAD) != "$baseline" ]]; then
+            git fetch --quiet --depth=1 origin "$baseline"
+            if ! git diff --quiet "$baseline" HEAD -- mail-worker/migrations mail-worker/src/init mail-worker/src/entity mail-worker/src/durable; then
+              echo '::error::OtsMail changed its database or Durable Object definitions. Verify the migration on a copy and update the deployment baseline before releasing.'
+              exit 1
+            fi
+          fi
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: |
+            upstream/mail-worker/pnpm-lock.yaml
+            upstream/mail-vue/pnpm-lock.yaml
+      - name: Test and build
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --dir mail-worker install --frozen-lockfile
+          pnpm --dir mail-vue install --frozen-lockfile
+          pnpm --dir mail-worker test
+          pnpm --dir mail-vue build
+          pnpm --dir mail-worker exec wrangler deploy --config ../wrangler.toml --dry-run --outdir "${RUNNER_TEMP}/otsmail-bundle"
+          mkdir -p ../package
+          mv "${RUNNER_TEMP}/otsmail-bundle/index.js" ../package/worker.js
+          mv mail-worker/dist ../package/assets
+          git rev-parse HEAD > ../package/source.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: otsmail-worker
+          path: package/
+          if-no-files-found: error
+          retention-days: 3
+
+  deploy:
+    if: (github.event_name == 'schedule' && vars.OTSMAIL_AUTO_UPDATE == 'true') || inputs.deploy
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          name: otsmail-worker
+          path: package
+      - name: Install deployment CLI
+        run: npm install --global wrangler@4.156.2
+      - name: Upload and activate Worker version
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          DATABASE_ID: ${{ vars.OTSMAIL_D1_ID }}
+          NAMESPACE_ID: ${{ vars.OTSMAIL_KV_ID }}
+          BUCKET_NAME: ${{ vars.OTSMAIL_R2_BUCKET }}
+          WEB_VERSION: ${{ needs.build.outputs.version }}
+          SITE_URL: https://mail.io0.cc
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$CLOUDFLARE_API_TOKEN" && -n "$CLOUDFLARE_ACCOUNT_ID" ]]
+          [[ "$DATABASE_ID" =~ ^[0-9a-f-]{36}$ && "$NAMESPACE_ID" =~ ^[0-9a-f]{32}$ && -n "$BUCKET_NAME" ]]
+          source=$(cat package/source.txt)
+          [[ "$source" =~ ^[0-9a-f]{40}$ ]]
+          tag=otsmail-${source:0:24}
+          config=.github/otsmail/wrangler.generated.json
+          jq --arg db "$DATABASE_ID" --arg kv "$NAMESPACE_ID" --arg r2 "$BUCKET_NAME" \
+            '.d1_databases = [{binding:"db",database_name:"cloud-mail",database_id:$db}]
+            | .kv_namespaces = [{binding:"kv",id:$kv}]
+            | .r2_buckets = [{binding:"r2",bucket_name:$r2}]' \
+            .github/otsmail/wrangler.json > "$config"
+          active=$(wrangler deployments status --config "$config" --json | jq -er '.versions[] | select(.percentage==100) | .version_id')
+          current_tag=$(wrangler versions view "$active" --config "$config" --json | jq -r '.annotations["workers/tag"] // ""')
+          if [[ "$current_tag" == "$tag" ]]; then
+            echo "OtsMail $WEB_VERSION ($source) is already deployed."
+            exit 0
+          fi
+          wrangler versions upload --config "$config" --no-bundle --tag "$tag" --message "OtsMail $WEB_VERSION ($source)" --var "WEB_VERSION:$WEB_VERSION" 2>&1 | tee "$RUNNER_TEMP/otsmail-upload.log"
+          candidate=$(sed -nE 's/^.*Worker Version ID: ([0-9a-f-]{36}).*$/\1/p' "$RUNNER_TEMP/otsmail-upload.log")
+          [[ "$candidate" =~ ^[0-9a-f-]{36}$ ]]
+          wrangler versions deploy "$candidate@100%" --config "$config" --yes --message "OtsMail $WEB_VERSION ($source)"
+          deployed=$(wrangler deployments status --config "$config" --json | jq -er '.versions[] | select(.percentage==100) | .version_id')
+          [[ "$deployed" == "$candidate" ]]
+          if ! curl --fail --silent --show-error --retry 3 --retry-all-errors --max-time 12 \
+            "$SITE_URL/api/setting/websiteConfig" | jq -e '.code == 200 and (.data.domainList | length > 0)' >/dev/null; then
+            wrangler versions deploy "$active@100%" --config "$config" --yes --message "Rollback after OtsMail health check failed"
+            echo "::error::Website configuration check failed. Previous Worker version restored."
+            exit 1
+          fi

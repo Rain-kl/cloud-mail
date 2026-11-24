@@ -1,0 +1,21 @@
+{
+  "name": "otsmail",
+  "main": "../../package/worker.js",
+  "compatibility_date": "2025-06-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "keep_vars": true,
+  "observability": {"enabled": true},
+  "assets": {
+    "binding": "assets",
+    "directory": "../../package/assets",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  "ai": {"binding": "ai"},
+  "send_email": [{"name": "forward"}],
+  "durable_objects": {
+    "bindings": [{"name": "EMAIL_HUB", "class_name": "EmailHub"}]
+  }
+}
