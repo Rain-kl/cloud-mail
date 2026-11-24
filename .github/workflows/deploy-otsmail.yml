@@ -152,7 +152,7 @@ jobs:
           deployed=$(wrangler deployments status --config "$config" --json | jq -er '.versions[] | select(.percentage==100) | .version_id')
           [[ "$deployed" == "$candidate" ]]
           if ! curl --fail --silent --show-error --retry 3 --retry-all-errors --max-time 12 \
-            "$SITE_URL/api/setting/websiteConfig" | jq -e '.code == 200 and (.data | has("loginTheme")) and (.data.domainList | length > 0)' >/dev/null; then
+            "$SITE_URL/api/setting/websiteConfig" | jq -e '.code == 200 and (.data | has("loginTheme")) and (.data.domainList | type == "array") and (.data.loginDomain == 1 or (.data.domainList | length > 0))' >/dev/null; then
             wrangler versions deploy "$active@100%" --config "$config" --yes --message "Rollback after OtsMail health check failed"
             echo "::error::Website configuration check failed. Previous Worker version restored."
             exit 1
